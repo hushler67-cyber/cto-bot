@@ -58,7 +58,8 @@ WATCHLIST = [a.strip() for a in os.getenv("WATCHLIST", "").split(",") if a.strip
 
 DEX = "https://api.dexscreener.com"
 GT = "https://api.geckoterminal.com/api/v2"
-GT_PAUSE = 2.5      # GeckoTerminal free tier is ~30 calls/minute
+GT_PAUSE = float(os.getenv("GT_PAUSE_SECONDS", "6.5"))   # GeckoTerminal really allows ~10 calls/minute
+ATH_LOOKUPS_PER_CYCLE = int(os.getenv("ATH_LOOKUPS_PER_CYCLE", "20"))
 DAS_PAUSE = 0.6     # Helius free plan allows 2 DAS calls/second
 DAY = 86400
 
@@ -77,7 +78,7 @@ def get_json(url, params=None, pause=0.0):
             try:
                 r = session.get(url, params=params, timeout=20)
                 if r.status_code == 429:
-                    wait = 10 * (attempt + 1)
+                    wait = 20 * (attempt + 1)
                     log.warning("Rate limited by %s, waiting %ss", url, wait)
                     time.sleep(wait)
                     continue
@@ -375,14 +376,14 @@ def check_tokens(conn):
     pairs = dex_best_pairs([r["address"] for r in rows])
     now = int(time.time())
     alerts = 0
+    ath_lookups = 0
 
     for row in rows:
         addr = row["address"]
-        conn.execute("UPDATE tokens SET last_checked = ? WHERE address = ?", (now, addr))
-        conn.commit()
-
         p = pairs.get(addr)
         if not p:
+            conn.execute("UPDATE tokens SET last_checked = ? WHERE address = ?", (now, addr))
+            conn.commit()
             continue
 
         price = float(p.get("priceUsd") or 0)
@@ -395,8 +396,18 @@ def check_tokens(conn):
         peak_holders = row["peak_holders"] or 0
         holders_checked = row["holders_checked_at"] or 0
 
+        needs_ath = price > 0 and mcap > 0 and now - ath_checked > DAY
+        if needs_ath and ath_lookups >= ATH_LOOKUPS_PER_CYCLE:
+            # Out of GeckoTerminal budget this round. Leave last_checked alone
+            # so this coin is first in line next cycle.
+            continue
+
+        conn.execute("UPDATE tokens SET last_checked = ? WHERE address = ?", (now, addr))
+        conn.commit()
+
         # Refresh the ATH from GeckoTerminal once a day per coin
-        if price > 0 and mcap > 0 and now - ath_checked > DAY:
+        if needs_ath:
+            ath_lookups += 1
             ath_price = gecko_ath_price(p["pairAddress"])
             if ath_price:
                 supply = mcap / price
@@ -460,7 +471,7 @@ def check_tokens(conn):
             alerts += 1
             log.info("Alert sent: %s", p["baseToken"].get("symbol"))
 
-    log.info("Checked %s coins, %s alerts", len(rows), alerts)
+    log.info("Checked %s coins, %s ATH lookups, %s alerts", len(rows), ath_lookups, alerts)
 
 
 # ---------------------------------------------------------------- main loop
@@ -472,7 +483,10 @@ def main():
 
     conn = db_connect()
     log.info("Database: %s", DB_PATH)
-    send_telegram("✅ CTO bot started. Watching Solana for rugged coins with a community.")
+    if DB_PATH == "cto.db":
+        log.warning("No Railway Volume at /data - the database resets on every redeploy.")
+    if not send_telegram("✅ CTO bot started. Watching Solana for rugged coins with a community."):
+        log.error("Can't post to TG_CHAT_ID=%s. Is the bot in that group? Is the ID right?", TG_CHAT_ID)
 
     while True:
         started = time.time()

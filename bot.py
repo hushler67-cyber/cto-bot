@@ -3,12 +3,18 @@ CTO Bot
 Finds Solana memecoins that were once big, got rugged, and still have a
 community you could take over. Sends an alert to Telegram for each one.
 
+Free data sources only:
+  - DexScreener   : price, market cap, liquidity, volume, socials, CTO list
+  - GeckoTerminal : daily candles -> all-time high
+  - Helius (free) : holder count, top 10 %, mint/freeze authority
+
 How it works (one "cycle" every SCAN_INTERVAL_SECONDS):
   1. discover()     - collect hot/boosted/trending Solana coins + your WATCHLIST
                       and remember them in SQLite.
-  2. check_tokens() - re-check remembered coins: current stats (DexScreener),
-                      all-time high (GeckoTerminal), and if the coin looks
-                      rugged: holders (Moralis) + mint/freeze authority (RPC).
+  2. check_tokens() - re-check remembered coins. While a coin is still big,
+                      the bot snapshots its holder count once a day, so it
+                      knows the peak. When a coin looks rugged it gets the
+                      full check.
   3. send_telegram()- "READY TO CTO" alert, once per coin.
 """
 
@@ -17,7 +23,6 @@ import logging
 import os
 import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -27,8 +32,12 @@ load_dotenv()
 # ---------------------------------------------------------------- settings
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-MORALIS_API_KEY = os.getenv("MORALIS_API_KEY", "")
-SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
+SOLANA_RPC = (
+    f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+    if HELIUS_API_KEY
+    else os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+)
 
 # On Railway, mount a Volume at /data so the database survives redeploys.
 DB_PATH = os.getenv("DB_PATH", "/data/cto.db" if os.path.isdir("/data") else "cto.db")
@@ -40,14 +49,18 @@ MAX_VOLUME_24H = float(os.getenv("MAX_VOLUME_24H", "20000"))    # trading is dea
 MIN_PEAK_HOLDERS = int(os.getenv("MIN_PEAK_HOLDERS", "500"))    # had a real community
 REQUIRE_SOCIALS = os.getenv("REQUIRE_SOCIALS", "true").lower() == "true"
 
+# Holder counting: 1 page = 1000 token accounts. 10 pages = counts up to 10,000.
+MAX_HOLDER_PAGES = int(os.getenv("MAX_HOLDER_PAGES", "10"))
+
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "600"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "60"))
 WATCHLIST = [a.strip() for a in os.getenv("WATCHLIST", "").split(",") if a.strip()]
 
 DEX = "https://api.dexscreener.com"
 GT = "https://api.geckoterminal.com/api/v2"
-MORALIS = "https://solana-gateway.moralis.io"
-GT_PAUSE = 2.5  # GeckoTerminal free tier is ~30 calls/minute
+GT_PAUSE = 2.5      # GeckoTerminal free tier is ~30 calls/minute
+DAS_PAUSE = 0.6     # Helius free plan allows 2 DAS calls/second
+DAY = 86400
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cto-bot")
@@ -57,12 +70,12 @@ session.headers.update({"accept": "application/json", "User-Agent": "cto-bot/1.0
 
 
 # ---------------------------------------------------------------- helpers
-def get_json(url, params=None, headers=None, pause=0.0):
+def get_json(url, params=None, pause=0.0):
     """GET a URL and return JSON. Retries on rate limits. Returns None on failure."""
     try:
         for attempt in range(3):
             try:
-                r = session.get(url, params=params, headers=headers, timeout=20)
+                r = session.get(url, params=params, timeout=20)
                 if r.status_code == 429:
                     wait = 10 * (attempt + 1)
                     log.warning("Rate limited by %s, waiting %ss", url, wait)
@@ -77,6 +90,27 @@ def get_json(url, params=None, headers=None, pause=0.0):
     finally:
         if pause:
             time.sleep(pause)
+
+
+def rpc(method, params):
+    """Call the Solana RPC (Helius if you set HELIUS_API_KEY). Returns result or None."""
+    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    for attempt in range(3):
+        try:
+            r = session.post(SOLANA_RPC, json=body, timeout=30)
+            if r.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            data = r.json()
+            if "error" in data:
+                log.warning("RPC %s error: %s", method, data["error"])
+                return None
+            return data.get("result")
+        except requests.RequestException as e:
+            log.warning("RPC %s failed: %s", method, e)
+            time.sleep(3)
+    return None
 
 
 def money(n):
@@ -105,6 +139,12 @@ def db_connect():
             added_at       INTEGER
         )"""
     )
+    # New columns for holder tracking (safe to run on an old database)
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(tokens)")]
+    if "peak_holders" not in cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN peak_holders INTEGER DEFAULT 0")
+    if "holders_checked_at" not in cols:
+        conn.execute("ALTER TABLE tokens ADD COLUMN holders_checked_at INTEGER DEFAULT 0")
     conn.execute("CREATE TABLE IF NOT EXISTS cto_done (address TEXT PRIMARY KEY)")
     conn.commit()
     return conn
@@ -189,51 +229,50 @@ def gecko_ath_price(pair_address):
     return max(float(c[2]) for c in candles)  # c = [time, open, high, low, close, volume]
 
 
-def moralis_holders(address, created_ms):
-    """Current holders, peak holders (last ~100 days), and top-10 % of supply."""
-    if not MORALIS_API_KEY:
-        return None
-    headers = {"X-API-Key": MORALIS_API_KEY}
-    stats = get_json(f"{MORALIS}/token/mainnet/holders/{address}", headers=headers) or {}
-
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(days=99)
-    if created_ms:
-        start = max(start, datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc))
-    hist = get_json(
-        f"{MORALIS}/token/mainnet/holders/{address}/historical",
-        headers=headers,
-        params={
-            "fromDate": start.strftime("%Y-%m-%dT%H:%M:%S"),
-            "toDate": now.strftime("%Y-%m-%dT%H:%M:%S"),
-            "timeFrame": "1d",
-            "limit": 100,
-        },
-    ) or {}
-
-    current = stats.get("totalHolders")
-    counts = [r.get("totalHolders") or 0 for r in hist.get("result", [])]
-    if current:
-        counts.append(current)
-    top10 = ((stats.get("holderSupply") or {}).get("top10") or {}).get("supplyPercent")
-    return {"current": current, "peak": max(counts) if counts else None, "top10": top10}
+def count_holders(mint):
+    """
+    Count wallets holding the coin (Helius DAS getTokenAccounts, 1000 per page).
+    Returns (count, capped). capped=True means there are more than we counted.
+    """
+    if not HELIUS_API_KEY:
+        return None, False
+    owners = set()
+    for page in range(1, MAX_HOLDER_PAGES + 1):
+        result = rpc(
+            "getTokenAccounts",
+            {"mint": mint, "page": page, "limit": 1000, "options": {"showZeroBalance": False}},
+        )
+        time.sleep(DAS_PAUSE)
+        if result is None:
+            return (len(owners) or None), False
+        accounts = result.get("token_accounts") or []
+        for acc in accounts:
+            if int(acc.get("amount") or 0) > 0 and acc.get("owner"):
+                owners.add(acc["owner"])
+        if len(accounts) < 1000:
+            return len(owners), False
+    return len(owners), True
 
 
-def mint_authorities(address):
-    """If mint or freeze authority is still active, the dev can still mess with the coin."""
-    body = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getAccountInfo",
-        "params": [address, {"encoding": "jsonParsed"}],
-    }
+def top10_percent(mint):
+    """% of supply in the 10 biggest token accounts (includes the LP pool account)."""
+    largest = rpc("getTokenLargestAccounts", [mint])
+    supply = rpc("getTokenSupply", [mint])
     try:
-        r = session.post(SOLANA_RPC, json=body, timeout=20)
-        r.raise_for_status()
-        info = r.json()["result"]["value"]["data"]["parsed"]["info"]
+        total = float(supply["value"]["uiAmount"] or 0)
+        top = sum(float(a.get("uiAmount") or 0) for a in largest["value"][:10])
+        return (top / total * 100) if total else None
+    except (TypeError, KeyError):
+        return None
+
+
+def mint_authorities(mint):
+    """If mint or freeze authority is still active, the dev can still mess with the coin."""
+    result = rpc("getAccountInfo", [mint, {"encoding": "jsonParsed"}])
+    try:
+        info = result["value"]["data"]["parsed"]["info"]
         return {"mint": info.get("mintAuthority"), "freeze": info.get("freezeAuthority")}
-    except Exception as e:
-        log.warning("RPC check failed for %s: %s", address, e)
+    except (TypeError, KeyError):
         return None
 
 
@@ -271,7 +310,13 @@ def send_telegram(text):
         return False
 
 
-def build_alert(pair, ath_mcap, drop, holders, auth, socials):
+def fmt_count(n, capped):
+    if n is None:
+        return "?"
+    return f"{n:,}+" if capped else f"{n:,}"
+
+
+def build_alert(pair, ath_mcap, drop, holders, auth, top10, socials):
     t = pair["baseToken"]
     mcap = pair.get("marketCap") or pair.get("fdv") or 0
     liq = (pair.get("liquidity") or {}).get("usd") or 0
@@ -293,9 +338,13 @@ def build_alert(pair, ath_mcap, drop, holders, auth, socials):
     ]
 
     if holders:
-        lines.append(f"Holders now: {holders['current'] or '?'} | Peak: {holders['peak'] or '?'}")
-        if holders["top10"] is not None:
-            lines.append(f"Top 10 wallets hold: {float(holders['top10']):.1f}%")
+        peak = holders["peak"]
+        lines.append(
+            f"Holders now: {fmt_count(holders['current'], holders['capped'])}"
+            f" | Peak seen: {fmt_count(peak, False) if peak else '?'}"
+        )
+    if top10 is not None:
+        lines.append(f"Top 10 accounts hold: {top10:.1f}% (incl. LP)")
 
     if auth:
         lines.append("Mint authority: " + ("revoked ✅" if not auth["mint"] else "ACTIVE ⚠️"))
@@ -343,9 +392,11 @@ def check_tokens(conn):
         peak_seen = max(row["peak_mcap_seen"] or 0, mcap)
         ath_mcap = row["ath_mcap"] or 0
         ath_checked = row["ath_checked_at"] or 0
+        peak_holders = row["peak_holders"] or 0
+        holders_checked = row["holders_checked_at"] or 0
 
         # Refresh the ATH from GeckoTerminal once a day per coin
-        if price > 0 and mcap > 0 and now - ath_checked > 86400:
+        if price > 0 and mcap > 0 and now - ath_checked > DAY:
             ath_price = gecko_ath_price(p["pairAddress"])
             if ath_price:
                 supply = mcap / price
@@ -353,9 +404,17 @@ def check_tokens(conn):
             ath_checked = now
         ath_mcap = max(ath_mcap, peak_seen)
 
+        # While a coin is still big, snapshot its holders once a day -> builds the peak
+        if HELIUS_API_KEY and mcap >= MIN_ATH_MCAP and now - holders_checked > DAY:
+            n, _ = count_holders(addr)
+            if n:
+                peak_holders = max(peak_holders, n)
+            holders_checked = now
+
         conn.execute(
             """UPDATE tokens SET name = ?, symbol = ?, pair_address = ?,
-               peak_mcap_seen = ?, ath_mcap = ?, ath_checked_at = ? WHERE address = ?""",
+               peak_mcap_seen = ?, ath_mcap = ?, ath_checked_at = ?,
+               peak_holders = ?, holders_checked_at = ? WHERE address = ?""",
             (
                 p["baseToken"].get("name"),
                 p["baseToken"].get("symbol"),
@@ -363,6 +422,8 @@ def check_tokens(conn):
                 peak_seen,
                 ath_mcap,
                 ath_checked,
+                peak_holders,
+                holders_checked,
                 addr,
             ),
         )
@@ -378,13 +439,21 @@ def check_tokens(conn):
         if REQUIRE_SOCIALS and not socials:
             continue
 
-        # --- expensive checks only for real candidates ---
-        holders = moralis_holders(addr, p.get("pairCreatedAt"))
-        if holders and holders["peak"] is not None and holders["peak"] < MIN_PEAK_HOLDERS:
-            continue
+        # --- Helius checks only for real candidates ---
+        holders = None
+        if HELIUS_API_KEY:
+            current, capped = count_holders(addr)
+            peak = max(peak_holders, current or 0) or None
+            holders = {"current": current, "capped": capped, "peak": peak}
+            if peak:
+                conn.execute("UPDATE tokens SET peak_holders = ? WHERE address = ?", (peak, addr))
+                conn.commit()
+            if peak is not None and peak < MIN_PEAK_HOLDERS:
+                continue
+        top10 = top10_percent(addr)
         auth = mint_authorities(addr)
 
-        msg = build_alert(p, ath_mcap, drop, holders, auth, socials)
+        msg = build_alert(p, ath_mcap, drop, holders, auth, top10, socials)
         if send_telegram(msg):
             conn.execute("UPDATE tokens SET alerted = 1 WHERE address = ?", (addr,))
             conn.commit()
@@ -398,8 +467,8 @@ def check_tokens(conn):
 def main():
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         raise SystemExit("Set TG_BOT_TOKEN and TG_CHAT_ID first.")
-    if not MORALIS_API_KEY:
-        log.warning("No MORALIS_API_KEY - alerts will have no holder numbers.")
+    if not HELIUS_API_KEY:
+        log.warning("No HELIUS_API_KEY - alerts will have no holder numbers.")
 
     conn = db_connect()
     log.info("Database: %s", DB_PATH)
